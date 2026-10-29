@@ -1,6 +1,7 @@
 """
 Telegram Broadcast Bot
 - Save broadcast messages (text, photo, video, GIF, document — formatting kept)
+- Attach link buttons to any broadcast (several per row, several rows)
 - Auto-tracks groups/channels where the bot is made admin
 - Send a saved broadcast to a chosen group (or all groups) on demand
 - Schedule a broadcast to repeat every N minutes / hours
@@ -58,6 +59,17 @@ INTERVAL_PRESETS = [
     ("30 min", 1800), ("1 hr", 3600), ("2 hrs", 7200), ("3 hrs", 10800),
     ("6 hrs", 21600), ("12 hrs", 43200), ("24 hrs", 86400),
 ]
+
+BUTTONS_HELP = (
+    "🔘 <b>Add buttons</b>\n\n"
+    "Send one row per line, in the format <code>Button text - link</code>.\n"
+    "To put several buttons on the same row, separate them with <code>|</code>.\n\n"
+    "<b>Example:</b>\n"
+    "<code>Join Channel - https://t.me/yourchannel\n"
+    "Website - https://example.com | Contact - https://t.me/yourname</code>\n\n"
+    "That makes 1 button on the first row and 2 on the second.\n"
+    "Links must start with https://, http:// or t.me/"
+)
 
 
 # ───────────────────────── Storage ─────────────────────────
@@ -129,6 +141,59 @@ def parse_interval(text: str):
     return secs if secs >= 60 else None
 
 
+def parse_buttons(text: str):
+    """
+    Parse button layout text.
+      One row per line; buttons in a row separated by '|'; each button is 'Text - URL'.
+    Returns (rows, error). rows = [[[text, url], ...], ...]
+    """
+    rows = []
+    for line_no, line in enumerate((text or "").splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        row = []
+        for chunk in line.split("|"):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            m = re.match(r"^(.+?)\s+[-–—]\s+(\S+)$", chunk)
+            if not m:
+                return None, f"Line {line_no}: “{chunk}” — use the format  Text - link"
+            label, url = m.group(1).strip(), m.group(2).strip()
+            if url.lower().startswith(("t.me/", "telegram.me/")):
+                url = "https://" + url
+            if not re.match(r"^(https?://|tg://)\S+\.?\S*$", url, re.I):
+                return None, f"Line {line_no}: “{url}” isn't a valid link (start it with https://)"
+            if len(label) > 64:
+                return None, f"Line {line_no}: button text is too long (max 64 characters)"
+            row.append([label, url])
+        if row:
+            if len(row) > 8:
+                return None, f"Line {line_no}: max 8 buttons per row"
+            rows.append(row)
+    if not rows:
+        return None, "I didn't find any buttons. Use the format  Text - link"
+    if sum(len(r) for r in rows) > 50:
+        return None, "Too many buttons (max 50)."
+    return rows, None
+
+
+def buttons_markup(bc: dict):
+    rows = bc.get("buttons") or []
+    if not rows:
+        return None
+    return M([[B(label, url=url) for label, url in row] for row in rows])
+
+
+def buttons_summary(bc: dict) -> str:
+    rows = bc.get("buttons") or []
+    if not rows:
+        return "No buttons"
+    n = sum(len(r) for r in rows)
+    return f"{n} button{'s' if n != 1 else ''} in {len(rows)} row{'s' if len(rows) != 1 else ''}"
+
+
 def group_title(gid: str) -> str:
     if gid == "all":
         return "All groups"
@@ -145,28 +210,29 @@ def extract_broadcast(msg) -> dict | None:
     """Turn a DM message into a storable broadcast (keeps formatting via entities)."""
     ents = [e.to_dict() for e in (msg.entities or msg.caption_entities or [])]
     if msg.text:
-        return {"type": "text", "text": msg.text, "entities": ents}
+        return {"type": "text", "text": msg.text, "entities": ents, "buttons": []}
     for kind in ("photo", "video", "animation", "document"):
         obj = getattr(msg, kind, None)
         if obj:
             file_id = obj[-1].file_id if kind == "photo" else obj.file_id
-            return {"type": kind, "file_id": file_id, "text": msg.caption, "entities": ents}
+            return {"type": kind, "file_id": file_id, "text": msg.caption, "entities": ents, "buttons": []}
     return None
 
 
 async def send_broadcast(bot, chat_id: int, bc: dict):
     ents = [MessageEntity.de_json(e, bot) for e in bc.get("entities", [])] or None
     kind, text = bc["type"], bc.get("text")
+    kb = buttons_markup(bc)
     if kind == "text":
-        await bot.send_message(chat_id, text, entities=ents)
+        await bot.send_message(chat_id, text, entities=ents, reply_markup=kb)
     elif kind == "photo":
-        await bot.send_photo(chat_id, bc["file_id"], caption=text, caption_entities=ents)
+        await bot.send_photo(chat_id, bc["file_id"], caption=text, caption_entities=ents, reply_markup=kb)
     elif kind == "video":
-        await bot.send_video(chat_id, bc["file_id"], caption=text, caption_entities=ents)
+        await bot.send_video(chat_id, bc["file_id"], caption=text, caption_entities=ents, reply_markup=kb)
     elif kind == "animation":
-        await bot.send_animation(chat_id, bc["file_id"], caption=text, caption_entities=ents)
+        await bot.send_animation(chat_id, bc["file_id"], caption=text, caption_entities=ents, reply_markup=kb)
     elif kind == "document":
-        await bot.send_document(chat_id, bc["file_id"], caption=text, caption_entities=ents)
+        await bot.send_document(chat_id, bc["file_id"], caption=text, caption_entities=ents, reply_markup=kb)
 
 
 async def send_to_targets(bot, bc: dict, gid: str) -> tuple[list, list]:
@@ -230,8 +296,22 @@ def back_kb(target="menu"):
     return M([[B("⬅️ Back", callback_data=target)]])
 
 
-def cancel_kb():
-    return M([[B("✖️ Cancel", callback_data="menu")]])
+def cancel_kb(target="menu"):
+    return M([[B("✖️ Cancel", callback_data=target)]])
+
+
+def manage_bc_kb(bid: str):
+    bc = store.broadcasts.get(bid, {})
+    has_btns = bool(bc.get("buttons"))
+    rows = [
+        [B("📤 Send now", callback_data=f"s:{bid}"), B("⏰ Schedule", callback_data=f"sc:{bid}")],
+        [B("🔘 Edit buttons" if has_btns else "🔘 Add buttons", callback_data=f"bb:{bid}")],
+    ]
+    if has_btns:
+        rows.append([B("🧹 Remove buttons", callback_data=f"bx:{bid}")])
+    rows.append([B("🗑 Delete broadcast", callback_data=f"d:{bid}")])
+    rows.append([B("⬅️ Back", callback_data="list_bc")])
+    return M(rows)
 
 
 def pick_bc_kb(prefix: str):
@@ -279,6 +359,21 @@ async def show_main(update: Update):
         f"Active schedules: <b>{len(store.schedules)}</b>\n\n"
         "Choose an option:",
         main_menu_kb(),
+    )
+
+
+async def preview_and_manage(chat, bot, bid: str, header: str = "👇 Preview:"):
+    """Send a live preview of the broadcast (with its buttons) followed by its manage menu."""
+    bc = store.broadcasts[bid]
+    await chat.send_message(header)
+    try:
+        await send_broadcast(bot, chat.id, bc)
+    except TelegramError as e:
+        await chat.send_message(f"⚠️ Preview failed: {e}")
+    await chat.send_message(
+        f"📄 <b>{esc(bc['name'])}</b>\n🔘 {buttons_summary(bc)}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=manage_bc_kb(bid),
     )
 
 
@@ -339,7 +434,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await show(
             update,
             "📝 <b>New broadcast</b>\n\nSend me the message exactly as you want it posted.\n"
-            "Supported: text, photo, video, GIF, document (with caption). Bold, italic and links are kept.",
+            "Supported: text, photo, video, GIF, document (with caption). Bold, italic and links are kept.\n\n"
+            "You can add link buttons right after saving.",
             cancel_kb(),
         )
 
@@ -352,23 +448,9 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif cmd == "v":
         bid = parts[1]
-        bc = store.broadcasts.get(bid)
-        if not bc:
+        if bid not in store.broadcasts:
             return await show(update, "That broadcast no longer exists.", back_kb("list_bc"))
-        await q.message.reply_text("👇 Preview:")
-        try:
-            await send_broadcast(ctx.bot, update.effective_chat.id, bc)
-        except TelegramError as e:
-            await q.message.reply_text(f"⚠️ Preview failed: {e}")
-        await update.effective_chat.send_message(
-            f"📄 <b>{esc(bc['name'])}</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=M([
-                [B("📤 Send now", callback_data=f"s:{bid}"), B("⏰ Schedule", callback_data=f"sc:{bid}")],
-                [B("🗑 Delete", callback_data=f"d:{bid}")],
-                [B("⬅️ Back", callback_data="list_bc")],
-            ]),
-        )
+        await preview_and_manage(update.effective_chat, ctx.bot, bid)
 
     elif cmd == "d":
         bid = parts[1]
@@ -379,6 +461,28 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if n:
             msg += f"\n⏹ Stopped {n} schedule(s) using it."
         await show(update, msg, back_kb("list_bc"))
+
+    # ── Link buttons on a broadcast
+    elif cmd == "bb":
+        bid = parts[1]
+        bc = store.broadcasts.get(bid)
+        if not bc:
+            return await show(update, "That broadcast no longer exists.", back_kb("list_bc"))
+        ctx.user_data["awaiting"] = {"kind": "buttons", "bid": bid}
+        text = BUTTONS_HELP
+        if bc.get("buttons"):
+            current = "\n".join(" | ".join(f"{t} - {u}" for t, u in row) for row in bc["buttons"])
+            text += f"\n\n<b>Current buttons</b> (sending new ones replaces them):\n<code>{esc(current)}</code>"
+        await show(update, text, cancel_kb(f"v:{bid}"))
+
+    elif cmd == "bx":
+        bid = parts[1]
+        bc = store.broadcasts.get(bid)
+        if not bc:
+            return await show(update, "That broadcast no longer exists.", back_kb("list_bc"))
+        bc["buttons"] = []
+        store.save()
+        await show(update, f"🧹 Removed buttons from <b>{esc(bc['name'])}</b>.", manage_bc_kb(bid))
 
     # ── Groups
     elif cmd == "groups":
@@ -416,6 +520,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif cmd == "s":
         bid = parts[1]
+        if bid not in store.broadcasts:
+            return await show(update, "That broadcast no longer exists.", back_kb())
         if not store.groups:
             return await show(update, "No groups yet. Make me admin in a group first.", back_kb())
         await show(update, f"📤 Send <b>{esc(store.broadcasts[bid]['name'])}</b> to which group?",
@@ -519,13 +625,27 @@ async def on_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         store.save()
         ctx.user_data.pop("awaiting", None)
         await msg.reply_text(
-            f"✅ Saved broadcast <b>{esc(bc['name'])}</b>",
+            f"✅ Saved broadcast <b>{esc(bc['name'])}</b>\n\nWant to add link buttons under it?",
             parse_mode=ParseMode.HTML,
             reply_markup=M([
+                [B("🔘 Add buttons", callback_data=f"bb:{bid}")],
                 [B("📤 Send now", callback_data=f"s:{bid}"), B("⏰ Schedule", callback_data=f"sc:{bid}")],
                 [B("⬅️ Menu", callback_data="menu")],
             ]),
         )
+
+    elif kind == "buttons":
+        bid = aw["bid"]
+        if bid not in store.broadcasts:
+            ctx.user_data.pop("awaiting", None)
+            return await msg.reply_text("That broadcast no longer exists.", reply_markup=back_kb("list_bc"))
+        rows, err = parse_buttons(msg.text or "")
+        if err:
+            return await msg.reply_text(f"⚠️ {err}\n\nTry again, or /cancel.")
+        store.broadcasts[bid]["buttons"] = rows
+        store.save()
+        ctx.user_data.pop("awaiting", None)
+        await preview_and_manage(update.effective_chat, ctx.bot, bid, header="✅ Buttons saved. Here's how it looks:")
 
     elif kind == "group_id":
         try:
