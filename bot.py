@@ -1,6 +1,7 @@
 """
 Telegram Broadcast Bot
 - Save broadcast messages (text, photo, video, GIF, document — formatting kept)
+- Edit or rename saved broadcasts (buttons and running schedules are kept)
 - Attach link buttons to any broadcast (several per row, several rows)
 - Auto-tracks groups/channels where the bot is made admin
 - Send a saved broadcast to a chosen group (or all groups) on demand
@@ -305,6 +306,7 @@ def manage_bc_kb(bid: str):
     has_btns = bool(bc.get("buttons"))
     rows = [
         [B("📤 Send now", callback_data=f"s:{bid}"), B("⏰ Schedule", callback_data=f"sc:{bid}")],
+        [B("✏️ Edit message", callback_data=f"em:{bid}"), B("🏷 Rename", callback_data=f"rn:{bid}")],
         [B("🔘 Edit buttons" if has_btns else "🔘 Add buttons", callback_data=f"bb:{bid}")],
     ]
     if has_btns:
@@ -461,6 +463,35 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if n:
             msg += f"\n⏹ Stopped {n} schedule(s) using it."
         await show(update, msg, back_kb("list_bc"))
+
+    # ── Edit a saved broadcast
+    elif cmd == "em":
+        bid = parts[1]
+        bc = store.broadcasts.get(bid)
+        if not bc:
+            return await show(update, "That broadcast no longer exists.", back_kb("list_bc"))
+        ctx.user_data["awaiting"] = {"kind": "edit_msg", "bid": bid}
+        await show(
+            update,
+            f"✏️ <b>Edit “{esc(bc['name'])}”</b>\n\n"
+            "Send the new version of the message — text, photo, video, GIF or document.\n"
+            "It replaces the old content. Its buttons and any running schedules are kept.\n\n"
+            "Tip: to change only the text, copy the preview above, edit it, and send it back.",
+            cancel_kb(f"v:{bid}"),
+        )
+
+    elif cmd == "rn":
+        bid = parts[1]
+        bc = store.broadcasts.get(bid)
+        if not bc:
+            return await show(update, "That broadcast no longer exists.", back_kb("list_bc"))
+        ctx.user_data["awaiting"] = {"kind": "rename", "bid": bid}
+        await show(
+            update,
+            f"🏷 Current name: <b>{esc(bc['name'])}</b>\n\nSend the new name (max 40 characters).\n"
+            "This is only the label in your menu — it isn't posted to groups.",
+            cancel_kb(f"v:{bid}"),
+        )
 
     # ── Link buttons on a broadcast
     elif cmd == "bb":
@@ -632,6 +663,46 @@ async def on_private_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [B("📤 Send now", callback_data=f"s:{bid}"), B("⏰ Schedule", callback_data=f"sc:{bid}")],
                 [B("⬅️ Menu", callback_data="menu")],
             ]),
+        )
+
+    elif kind == "edit_msg":
+        bid = aw["bid"]
+        old = store.broadcasts.get(bid)
+        if not old:
+            ctx.user_data.pop("awaiting", None)
+            return await msg.reply_text("That broadcast no longer exists.", reply_markup=back_kb("list_bc"))
+        new = extract_broadcast(msg)
+        if not new:
+            return await msg.reply_text("Unsupported message type. Send text, photo, video, GIF or a document.")
+        new["name"] = old["name"]
+        new["buttons"] = old.get("buttons", [])
+        store.broadcasts[bid] = new
+        store.save()
+        ctx.user_data.pop("awaiting", None)
+        n = sum(1 for s in store.schedules.values() if s["bid"] == bid)
+        header = "✅ Broadcast updated."
+        if n:
+            header += f" {n} running schedule(s) will post the new version."
+        await preview_and_manage(update.effective_chat, ctx.bot, bid, header=header + "\n👇 Preview:")
+
+    elif kind == "rename":
+        bid = aw["bid"]
+        bc = store.broadcasts.get(bid)
+        if not bc:
+            ctx.user_data.pop("awaiting", None)
+            return await msg.reply_text("That broadcast no longer exists.", reply_markup=back_kb("list_bc"))
+        name = " ".join((msg.text or "").split())
+        if not name:
+            return await msg.reply_text("Send the name as text, or /cancel.")
+        if len(name) > 40:
+            return await msg.reply_text(f"That's {len(name)} characters — keep it to 40 or less.")
+        bc["name"] = name
+        store.save()
+        ctx.user_data.pop("awaiting", None)
+        await msg.reply_text(
+            f"🏷 Renamed to <b>{esc(name)}</b>\n🔘 {buttons_summary(bc)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=manage_bc_kb(bid),
         )
 
     elif kind == "buttons":
